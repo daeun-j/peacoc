@@ -94,7 +94,7 @@ class PeacocServer(FedAvgServer):
 
                 gFval_params_cache.append(gFval_m)
                 gFtrg_params_cache.append(gFtrg_m)
-                beta_weight_cache.append(self.beta_dict[E][client_id].item())
+                beta_weight_cache.append(self.beta_dict[E][client_id])
                 client_ids.append(client_id)
             self.aggregate(gFval_params_cache, gFtrg_params_cache, beta_weight_cache, client_ids)
             self.log_info()
