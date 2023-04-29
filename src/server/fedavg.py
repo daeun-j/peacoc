@@ -367,7 +367,7 @@ class FedAvgServer:
                 self.loss_metrics[f"{label}_before"].append(losses_before)
                 self.loss_metrics[f"{label}_after"].append(losses_after)
                 
-                                # ADD
+                # ADD
                 bftable = [self.client_stats[c][self.current_epoch]["before"][f"{label}_correct"]/
                         self.client_stats[c][self.current_epoch]["before"][f"{label}_size"] *100
                             if c in self.selected_clients else 0 for c, _ in enumerate([0]*self.client_num_in_total)]
@@ -457,18 +457,18 @@ class FedAvgServer:
             )
             
             # ADD
-            # for label, acc in self.table.items():
-            #     if 'after' in label:
-            #         pd.DataFrame(np.array(self.table[label][1:])).to_csv(
-            #                 OUT_DIR /  self.args.dataset/ self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_acc_metrics.csv",
-            #                 index=False,
-            #             )
-            # for label, acc in self.loss_table.items():
-            #     if 'after' in label:
-            #         pd.DataFrame(np.array(self.loss_table[label][1:])).to_csv(
-            #                 OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_loss_metrics.csv",
-            #                 index=False,
-            #             )
+            for label, acc in self.table.items():
+                if 'after' in label:
+                    pd.DataFrame(np.array(self.table[label][1:])).to_csv(
+                            OUT_DIR /  self.args.dataset/ self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_acc_metrics.csv",
+                            index=False,
+                        )
+            for label, acc in self.loss_table.items():
+                if 'after' in label:
+                    pd.DataFrame(np.array(self.loss_table[label][1:])).to_csv(
+                            OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_loss_metrics.csv",
+                            index=False,
+                        )
                 
         if self.args.save_fig and (self.args.global_epoch != 0):
             import matplotlib
