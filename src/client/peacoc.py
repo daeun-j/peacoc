@@ -32,19 +32,19 @@ class PeacocClient(FedAvgClient):
             cid: deepcopy(self.gFtrg_pers_model.state_dict()) for cid in range(client_num)
         }
 
-        self.beta, self.gb = torch.FloatTensor([0]), torch.FloatTensor([0])
+        self.beta, self.gb = torch.tensor([0]), torch.tensor([0])
         self.nlayers = num_layers(model)
         self.beta_dict = {
-            cid: self.beta.item() for cid in range(client_num)
+            cid: self.beta for cid in range(client_num)
         }
         self.gb_dict = {
-            cid: (self.gb.item(), self.norm1.item(), self.norm2.item()) for cid in range(client_num)
+            cid: (self.gb, self.norm1.item(), self.norm2.item()) for cid in range(client_num)
         }
                    
     def save_state(self):
         self.opt_state_dict[self.client_id] = deepcopy(self.optimizer.state_dict())
-        self.beta_dict[self.client_id] = deepcopy(self.beta.item()) 
-        self.gb_dict[self.client_id] = (deepcopy(torch.Tensor(self.gb)), self.norm1, self.norm2)
+        self.beta_dict[self.client_id] = deepcopy(self.beta) 
+        self.gb_dict[self.client_id] = (deepcopy(self.gb), self.norm1, self.norm2)
         self.personal_params_dict[self.client_id] = deepcopy(self.pers_model.state_dict())
         self.gFval_pers_model_params_dict[self.client_id] = deepcopy(self.gFval_pers_model.state_dict())
         self.gFtrg_pers_model_params_dict[self.client_id] = deepcopy(self.gFtrg_pers_model.state_dict())
@@ -74,8 +74,8 @@ class PeacocClient(FedAvgClient):
         eval_stats = self.train_and_log(verbose=verbose)
         return( deepcopy(trainable_params(self.gFval_pers_model)),
                 deepcopy(trainable_params(self.gFtrg_pers_model)), 
-                deepcopy(self.beta),
-                deepcopy(self.gb),
+                deepcopy(torch.tensor([self.beta])),
+                deepcopy(torch.tensor([self.gb])),
                 eval_stats,
                 )
 
@@ -101,14 +101,15 @@ class PeacocClient(FedAvgClient):
                         trainable_params(training_model),
                         trainable_params(self.model),
                         ):
-                        pers_param_copy = self.beta.item() * (pers_param.clone() - global_param.clone())
+                        beta = self.beta.item()
+                        pers_param_copy = beta * (pers_param.clone() - global_param.clone())
                         pers_param_grad_copy = pers_param.grad.clone()  # make a copy of pers_param
                         pers_param.grad.data = pers_param_grad_copy + pers_param_copy # assign the modified copy back to pers_param `
                 optimizer.step()
                 
     def fit(self):
-        if self.beta == 0 and  self.gb ==  0:
-            self.beta, self.gb = self.args.invlmb[self.client_id], torch.FloatTensor([0])
+        if self.beta == 0 and  self.gb == 0:
+            self.beta, self.gb = torch.tensor([self.args.invlmb[self.client_id]]), torch.tensor([0])
         sub_gi, global_model = deepcopy(self.model), deepcopy(self.model)
         for sub_gi_param, pers_param in zip(
                     sub_gi.parameters(),
@@ -117,16 +118,15 @@ class PeacocClient(FedAvgClient):
             sub_gi_param.data = sub_gi_param.data - pers_param.data
         cos, self.norm1, self.norm2 = multiply_model(trainable_params(sub_gi), trainable_params(self.gFval_pers_model), normalize=True)
         if self.args.ab == 'b' or self.args.ab == 'B': 
-            self.gb = self.args.local_lr * torch.FloatTensor([cos])
+            self.gb = self.args.local_lr * cos
             new_beta = self.beta - self.gb 
             gb = deepcopy(self.gb)
             self.gb = gb
             if new_beta >= 0:
-                self.beta = torch.FloatTensor([new_beta])
-            del gb
-        else:
-            self.beta = torch.FloatTensor([self.beta]) 
-        
+                self.beta = new_beta
+                # print(type(self.beta), self.beta, type(self.gb), self.gb)
+            self.beta, self.gb = torch.tensor([self.beta]), torch.tensor([self.gb])
+
         self._fit( global_model, self.trainloader, self.local_epoch)
         self._fit( self.pers_model, self.trainloader, self.local_epoch)
 
@@ -147,3 +147,6 @@ class PeacocClient(FedAvgClient):
         
     def evaluate(self) -> Dict[str, Dict[str, float]]:
         return super().evaluate(self.pers_model)
+
+    def _evaluate(self) -> Dict[str, Dict[str, float]]:
+        return super().evaluate(self.model)
