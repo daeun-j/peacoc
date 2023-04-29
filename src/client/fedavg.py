@@ -1,287 +1,582 @@
 import pickle
+import sys
+import json
+import os
+import random
 from argparse import Namespace
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 from path import Path
 from rich.console import Console
-from torch.optim import SGD
-from torch.utils.data import DataLoader, Subset
-from torchvision.transforms import Compose, Normalize
+from rich.progress import track
+from tqdm import tqdm
 
 _PROJECT_DIR = Path(__file__).parent.parent.parent.abspath()
 
-from src.config.utils import trainable_params, evaluate
-from src.config.models import DecoupledModel
-from data.utils.constants import MEAN, STD
-from data.utils.datasets import DATASETS
-from sklearn.model_selection import train_test_split
+sys.path.append(_PROJECT_DIR)
 
-class FedAvgClient:
-    def __init__(self, model: DecoupledModel, args: Namespace, logger: Console):
-        self.args = args
-        self.device = torch.device(
-            "cuda" if self.args.client_cuda and torch.cuda.is_available() else "cpu"
-        )
-        self.client_id: int = None
+from src.config.utils import OUT_DIR, fix_random_seed, trainable_params
+from src.config.models import MODEL_DICT
+from src.config.args import get_fedavg_argparser
+from src.client.fedavg import FedAvgClient
+import numpy as np
+import pandas as pd
+import wandb
+import math
+from torch.nn.functional import normalize
 
-        # load dataset and clients' data indices
+
+        
+class FedAvgServer:
+    def __init__(
+        self,
+        algo: str = "FedAvg",
+        args: Namespace = None,
+        unique_model=False,
+        default_trainer=True,
+    ):
+        self.args = get_fedavg_argparser().parse_args() if args is None else args
+        self.algo = algo
+        self.unique_model = unique_model
+        fix_random_seed(self.args.seed)
+        with open(_PROJECT_DIR / "data" / self.args.dataset / "args.json", "r") as f:
+            self.args.dataset_args = json.load(f)
+        self.fn = self.args.fn
+        # get client party info
+        self.train_clients: List[int] = None
+        self.test_clients: List[int] = None
+        self.client_num_in_total: int = None
         try:
             partition_path = _PROJECT_DIR / "data" / self.args.dataset / "partition.pkl"
             with open(partition_path, "rb") as f:
                 partition = pickle.load(f)
         except:
             raise FileNotFoundError(f"Please partition {args.dataset} first.")
+        self.train_clients = partition["separation"]["train"]
+        self.test_clients = partition["separation"]["test"]
+        self.client_num_in_total = partition["separation"]["total"]
 
-        self.data_indices: List[List[int]] = partition["data_indices"]
-        self.eval_model = self.args.eval_model
-        transform = Compose(
-            [Normalize(MEAN[self.args.dataset], STD[self.args.dataset])]
+        # init model(s) parameters
+        self.device = torch.device(
+            "cuda" if self.args.server_cuda and torch.cuda.is_available() else "cpu"
         )
-        # transform = None
-        target_transform = None
-
-        self.dataset = DATASETS[self.args.dataset](
-            root=_PROJECT_DIR / "data" / args.dataset,
-            args=args.dataset_args,
-            transform=transform,
-            target_transform=target_transform,
+        self.model = MODEL_DICT[self.args.model](self.args.dataset).to(self.device)
+        self.model.check_avaliability()
+        self.trainable_params_name, init_trainable_params = trainable_params(
+            self.model, requires_name=True
         )
 
-        self.trainloader: DataLoader = None
-        self.testloader: DataLoader = None
-        self.valloader: DataLoader = None
-        
-        self.trainset: Subset = Subset(self.dataset, indices=[])
-        self.testset: Subset = Subset(self.dataset, indices=[])
-        self.valset: Subset = Subset(self.dataset, indices=[])
+        # client_trainable_params is for pFL, which outputs exclusive model per client
+        # global_params_dict is for regular FL, which outputs a single global model
+        if self.unique_model:
+            self.client_trainable_params: List[List[torch.Tensor]] = [
+                deepcopy(init_trainable_params) for _ in self.train_clients
+            ]
+        self.global_params_dict: OrderedDict[str, torch.nn.Parameter] = OrderedDict(
+            zip(self.trainable_params_name, deepcopy(init_trainable_params))
+        )
 
-        self.model = model.to(self.device)
-        self.pers_model = model.to(self.device)
-        self.local_epoch = self.args.local_epoch
-        self.local_lr = self.args.local_lr
-        self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
-        self.logger = logger
-        self.personal_params_dict: Dict[int, Dict[str, torch.Tensor]] = {}
-        self.personal_params_name: List[str] = []
-        self.init_personal_params_dict: Dict[str, torch.Tensor] = {
-            key: param.clone().detach()
-            for key, param in self.model.state_dict(keep_vars=True).items()
-            if not param.requires_grad
-        }
-        self.opt_state_dict = {}
-        self.optimizer = SGD(
-            trainable_params(self.model),
-            self.local_lr,
-            self.args.momentum,
-            self.args.weight_decay,
-        )      
-        
-    def load_dataset(self):
-        self.trainset.indices = self.data_indices[self.client_id]["train"]
-        self.testset.indices = self.data_indices[self.client_id]["test"]
-        self.valset.indices = self.data_indices[self.client_id]["val"]
-        
-        self.trainloader = DataLoader(self.trainset, self.args.batch_size)
-        self.testloader = DataLoader(self.testset, self.args.batch_size)
-        self.valloader = DataLoader(self.valset, self.args.batch_size)
-
-    def train_and_log(self, verbose=False) -> Dict[str, Dict[str, float]]:
-        before = {
-            "train_loss": 0,
-            "test_loss": 0,
-            "val_loss": 0,
-            "train_correct": 0,
-            "test_correct": 0,
-            "val_correct": 0,
-            "train_size": 1,
-            "test_size": 1,
-            "val_size": 1,
-        }
-        after = deepcopy(before)
-        before = self.evaluate()
-        if self.local_epoch > 0:
-            self.fit()
-            self.save_state()
-            after = self.evaluate()
-        if verbose:
-            if len(self.trainset) > 0 and self.args.eval_train:
-                self.logger.log(
-                    "client [{}] (train)  [bold red]loss: {:.4f} -> {:.4f}   [bold blue]acc: {:.2f}% -> {:.2f}%".format(
-                        self.client_id,
-                        before["train_loss"] / before["train_size"],
-                        after["train_loss"] / after["train_size"],
-                        before["train_correct"] / before["train_size"] * 100.0,
-                        after["train_correct"] / after["train_size"] * 100.0,
-                    )
+        # To make sure all algorithms run through the same client sampling stream.
+        # Some algorithms' implicit operations at client side may disturb the stream if sampling happens at each FL round's beginning.
+       
+        if self.args.join_ratio == 1.0:
+            self.client_sample_stream = [
+                random.sample(
+                    self.train_clients, int(self.client_num_in_total * self.args.join_ratio)
                 )
-            if len(self.testset) > 0 and self.args.eval_test:
-                self.logger.log(
-                    "client [{}] (test)  [bold red]loss: {:.4f} -> {:.4f}   [bold blue]acc: {:.2f}% -> {:.2f}%".format(
-                        self.client_id,
-                        before["test_loss"] / before["test_size"],
-                        after["test_loss"] / after["test_size"],
-                        before["test_correct"] / before["test_size"] * 100.0,
-                        after["test_correct"] / after["test_size"] * 100.0,
-                    )
-                )
-            if len(self.valset) > 0 and self.args.eval_val:
-                self.logger.log(
-                    "client [{}] (val)  [bold red]loss: {:.4f} -> {:.4f}   [bold blue]acc: {:.2f}% -> {:.2f}%".format(
-                        self.client_id,
-                        before["val_loss"] / before["val_size"],
-                        after["val_loss"] / after["val_size"],
-                        before["val_correct"] / before["val_size"] * 100.0,
-                        after["val_correct"] / after["val_size"] * 100.0,
-                    )
-                )
-
-        eval_stats = {"before": before, "after": after}
-        return eval_stats
-
-    def set_parameters(self, new_parameters: OrderedDict[str, torch.nn.Parameter]):
-        personal_parameters = self.init_personal_params_dict
-        if self.client_id in self.personal_params_dict.keys():
-            personal_parameters = self.personal_params_dict[self.client_id]
-        if self.client_id in self.opt_state_dict.keys():
-            self.optimizer.load_state_dict(self.opt_state_dict[self.client_id])
-        self.model.load_state_dict(new_parameters, strict=False)
-        # personal params would overlap the dummy params from new_parameters at the same layers
-        self.model.load_state_dict(personal_parameters, strict=False)
-
-    def save_state(self):
-        self.personal_params_dict[self.client_id] = {
-            key: param.clone().detach()
-            for key, param in self.model.state_dict(keep_vars=True).items()
-            if (not param.requires_grad) or (key in self.personal_params_name)
-        }
-        self.opt_state_dict[self.client_id] = deepcopy(self.optimizer.state_dict())
-
-    def train(
-        self,
-        client_id: int,
-        new_parameters: OrderedDict[str, torch.nn.Parameter],
-        return_diff=True,
-        verbose=False,
-    ) -> Tuple[List[torch.nn.Parameter], int, Dict]:
-        self.client_id = client_id
-        self.load_dataset()
-        self.set_parameters(new_parameters)
-        eval_stats = self.train_and_log(verbose=verbose)
-
-        if return_diff:
-            delta = OrderedDict()
-            for (name, p0), p1 in zip(
-                new_parameters.items(), trainable_params(self.model)
-            ):
-                delta[name] = p0.to(self.device) - p1
-
-            return delta, len(self.trainset), eval_stats
+                for _ in range(self.args.global_epoch)
+            ]
         else:
-            return (
-                deepcopy(trainable_params(self.model)),
-                len(self.trainset),
-                eval_stats,
+            self.client_sample_stream = [
+            random.sample(
+                self.train_clients, int(self.client_num_in_total * self.args.join_ratio)
             )
+            for _ in range(self.args.global_epoch)
+            ]
+ 
+        self.selected_clients: List[int] = []
+        self.current_epoch = 0
+
+        # variables for logging
+        if self.args.visible:
+            from visdom import Visdom
+
+            self.viz = Visdom()
+            self.viz_win_name = (
+                f"{self.algo}"
+                + f"_{self.args.dataset}"
+                + f"_{self.args.global_epoch}"
+                + f"_{self.args.local_epoch}"
+            )
+        self.client_stats = {i: {} for i in self.train_clients}
+        self.metrics = {
+            "train_before": [],
+            "train_after": [],
+            "test_before": [],
+            "test_after": [],
+            "val_before": [],
+            "val_after": [],
+        }
+        self.loss_metrics = {
+            "train_before": [],
+            "train_after": [],
+            "test_before": [],
+            "test_after": [],
+            "val_before": [],
+            "val_after": [],
+        }
+        self.logger = Console(record=self.args.save_log, log_path=False, log_time=False)
+        self.test_results: Dict[int, Dict[str, str]] = {}
+        self.train_progress_bar = (
+            track(
+                range(self.args.global_epoch),
+                "[bold green]Training...",
+                console=self.logger,
+            )
+            if not self.args.save_log
+            else tqdm(range(self.args.global_epoch), "Training...")
+        )
+
+        self.logger.log("=" * 20, "ALGORITHM:", self.algo, "=" * 20)
+        self.logger.log("Experiment Arguments:", dict(self.args._get_kwargs()))
+
+        # init trainer
+        self.trainer = None
+        if default_trainer:
+            self.trainer = FedAvgClient(deepcopy(self.model), self.args, self.logger)
+
+        # ADD personalization performance metrics
+        self.table = {
+            "train_before": [],
+            "train_after": [],
+            "test_before": [],
+            "test_after": [],
+            "val_before": [],
+            "val_after": [],
+            }
+        self.loss_table = {
+            "train_before": [],
+            "train_after": [],
+            "test_before": [],
+            "test_after": [],
+            "val_before": [],
+            "val_after": [],
+            }
+        
+        
+        ## init parameters
+        self.args.lmb = [None] * self.client_num_in_total
+        self.args.invlmb = [None]
+
+        for cid in range(self.client_num_in_total):
+            self.args.lmb[cid] = len(partition["data_indices"][cid]["train"])
+        self.args.lmb = torch.FloatTensor(self.args.lmb)
+        self.args.lmb = normalize(self.args.lmb, p=1.0, dim = 0) #self.args.lmb**2
+        self.args.invlmb = 1/(self.args.lmb)#1/(self.args.lmb**2)
+        self.args.invlmb = normalize(self.args.invlmb, p=1.0, dim = 0)
+
+    
+    def train(self):
+        for E in self.train_progress_bar:
+            self.current_epoch = E
+
+            if (E + 1) % self.args.verbose_gap == 0:
+                self.logger.log("-" * 26, f"TRAINING EPOCH: {E + 1}", "-" * 26)
+
+            if (E + 1) % self.args.test_gap == 0:
+                self.test()
+
+            self.selected_clients = self.client_sample_stream[E]
+
+            delta_cache = []
+            weight_cache = []
+            
+            for client_id in self.selected_clients:
+
+                client_local_params = self.generate_client_params(client_id)
+
+                delta, weight, self.client_stats[client_id][E] = self.trainer.train(
+                    client_id=client_id,
+                    new_parameters=client_local_params,
+                    verbose=((E + 1) % self.args.verbose_gap) == 0,
+                )
+                weight = self.args.lmb.clone().detach()[client_id]
+
+                delta_cache.append(delta)
+                weight_cache.append(weight)
+                
+            self.aggregate(delta_cache, weight_cache)
+            self.log_info()
+
+      
+    def test(self):
+        loss_before, loss_after = [], []
+        correct_before, correct_after = [], []
+        num_samples = []
+        for client_id in self.test_clients:
+            client_local_params = self.generate_client_params(client_id)
+            stats = self.trainer.test(client_id, client_local_params)
+
+            correct_before.append(stats["before"]["test_correct"])
+            correct_after.append(stats["after"]["test_correct"])
+            loss_before.append(stats["before"]["test_loss"])
+            loss_after.append(stats["after"]["test_loss"])
+            num_samples.append(stats["before"]["test_size"])
+            
+        loss_before = torch.tensor(loss_before)
+        loss_after = torch.tensor(loss_after)
+        correct_before = torch.tensor(correct_before)
+        correct_after = torch.tensor(correct_after)
+        num_samples = torch.tensor(num_samples)
+        
+        self.test_results[self.current_epoch + 1] = {
+            "loss": "{:.4f} -> {:.4f}".format(
+                loss_before.sum() / num_samples.sum(),
+                loss_after.sum() / num_samples.sum(),
+            ),
+            "accuracy": "{:.2f}% -> {:.2f}%".format(
+                correct_before.sum() / num_samples.sum() * 100,
+                correct_after.sum() / num_samples.sum() * 100,
+            ),
+        }
 
     @torch.no_grad()
-    def evaluate(self, model: torch.nn.Module = None) -> Dict[str, Dict[str, float]]:
-        eval_model = self.model if model is None else model
-        # eval_model = self.model if model is None else model
-        eval_model.eval()
-        train_loss, test_loss = 0, 0
-        train_correct, test_correct = 0, 0
-        val_correct, val_correct = 0, 0
-        train_sample_num, test_sample_num, val_sample_num = 0, 0, 0
-        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
-
-        if len(self.testset) > 0 and self.args.eval_test:
-            test_loss, test_correct, test_sample_num = evaluate(
-                model=eval_model,
-                dataloader=self.testloader,
-                criterion=criterion,
-                device=self.device,
+    def update_client_params(self, client_params_cache: List[List[torch.nn.Parameter]]):
+        if self.unique_model:
+            for i, client_id in enumerate(self.selected_clients):
+                self.client_trainable_params[client_id] = [
+                    param.detach().to(self.device) for param in client_params_cache[i]
+                ]
+        else:
+            raise RuntimeError(
+                "FL system don't preserve params for each client (unique_model = False)."
             )
 
-        if len(self.trainset) > 0 and self.args.eval_train:
-            train_loss, train_correct, train_sample_num = evaluate(
-                model=eval_model,
-                dataloader=self.trainloader,
-                criterion=criterion,
-                device=self.device,
-            )        
-        if len(self.valset) > 0 and self.args.eval_val:
-            val_loss, val_correct, val_sample_num = evaluate(
-                model=eval_model,
-                dataloader=self.valloader,
-                criterion=criterion,
-                device=self.device,
+    def generate_client_params(self, client_id: int) -> OrderedDict[str, torch.Tensor]:
+        if self.unique_model:
+            return OrderedDict(
+                zip(self.trainable_params_name, self.client_trainable_params[client_id])
+            )
+        else:
+            return self.global_params_dict
+
+    @torch.no_grad()
+    def aggregate(self, delta_cache: List[List[torch.Tensor]], weight_cache: List[int]):
+        weights = torch.tensor(weight_cache, device=self.device) / sum(weight_cache)
+        # print(delta_cache, type(delta_cache))
+        delta_list = [list(delta.values()) for delta in delta_cache]
+        aggregated_delta = [
+            torch.sum(weights * torch.stack(diff, dim=-1), dim=-1)
+            for diff in zip(*delta_list)
+        ]
+        for param, diff in zip(self.global_params_dict.values(), aggregated_delta):
+            param.data -= diff.to(self.device)
+            
+            
+    def check_convergence(self):
+        for label, metric in self.metrics.items():
+            if len(metric) > 0:
+                self.logger.log(f"Convergence ({label}):")
+                acc_range = [90.0, 80.0, 70.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0]
+                min_acc_idx = 10
+                max_acc = 0
+                for E, acc in enumerate(metric):
+                    for i, target in enumerate(acc_range):
+                        if acc >= target and acc > max_acc:
+                            self.logger.log(
+                                "{} achieved {}%({:.2f}%) at epoch: {}".format(
+                                    self.algo, target, acc, E
+                                )
+                            )
+                            max_acc = acc
+                            min_acc_idx = i
+                            break
+                    acc_range = acc_range[:min_acc_idx]
+
+    def log_info(self):
+        for label in ["train", "test", "val"]:
+            # In the `user` split, there is no test data held by train clients, so plotting is unnecessary.
+            if (label == "train" and self.args.eval_train) or (label == "test"
+                and self.args.eval_test
+                and self.args.dataset_args["split"] != "user"
+            ) or (label == "val"
+                and self.args.eval_val
+                and self.args.dataset_args["split"] != "user"
+            ):
+                correct_before = torch.tensor(
+                    [
+                        self.client_stats[c][self.current_epoch]["before"][
+                            f"{label}_correct"
+                        ]
+                        for c in self.selected_clients
+                    ]
+                )
+                correct_after = torch.tensor(
+                    [
+                        self.client_stats[c][self.current_epoch]["after"][
+                            f"{label}_correct"
+                        ]
+                        for c in self.selected_clients
+                    ]
+                )
+                loss_before = torch.tensor(
+                    [
+                        self.client_stats[c][self.current_epoch]["before"][
+                            f"{label}_loss"
+                        ]
+                        for c in self.selected_clients
+                    ]
+                )
+                loss_after = torch.tensor(
+                    [
+                        self.client_stats[c][self.current_epoch]["after"][
+                            f"{label}_loss"
+                        ]
+                        for c in self.selected_clients
+                    ]
+                )
+                
+                num_samples = torch.tensor(
+                    [
+                        self.client_stats[c][self.current_epoch]["before"][
+                            f"{label}_size"
+                        ]
+                        for c in self.selected_clients
+                    ]
+                )
+
+                acc_before = (
+                    correct_before.sum(dim=-1, keepdim=True) / num_samples.sum() * 100.0
+                ).item()
+                acc_after = (
+                    correct_after.sum(dim=-1, keepdim=True) / num_samples.sum() * 100.0
+                ).item()
+                
+                losses_before = (
+                    loss_before.sum(dim=-1, keepdim=True) / num_samples.sum()
+                ).item()
+                losses_after = (
+                    loss_after.sum(dim=-1, keepdim=True) / num_samples.sum()
+                ).item()
+                
+                self.metrics[f"{label}_before"].append(acc_before)
+                self.metrics[f"{label}_after"].append(acc_after)
+                self.loss_metrics[f"{label}_before"].append(losses_before)
+                self.loss_metrics[f"{label}_after"].append(losses_after)
+                
+                # ADD
+                bftable = [self.client_stats[c][self.current_epoch]["before"][f"{label}_correct"]/
+                        self.client_stats[c][self.current_epoch]["before"][f"{label}_size"] *100
+                            if c in self.selected_clients else 0 for c, _ in enumerate([0]*self.client_num_in_total)]
+                bfloss_table = [self.client_stats[c][self.current_epoch]["before"][f"{label}_loss"]/
+                        self.client_stats[c][self.current_epoch]["before"][f"{label}_size"]
+                            if c in self.selected_clients else 0 for c, _ in enumerate([0]*self.client_num_in_total)]
+                table = [self.client_stats[c][self.current_epoch]["after"][f"{label}_correct"]/
+                        self.client_stats[c][self.current_epoch]["before"][f"{label}_size"] *100
+                            if c in self.selected_clients else 0 for c, _ in enumerate([0]*self.client_num_in_total)]
+                loss_table = [self.client_stats[c][self.current_epoch]["after"][f"{label}_loss"]/
+                        self.client_stats[c][self.current_epoch]["before"][f"{label}_size"]
+                            if c in self.selected_clients else 0 for c, _ in enumerate([0]*self.client_num_in_total)]
+                self.table[f"{label}_after"].append(table)
+                self.loss_table[f"{label}_after"].append(loss_table)
+                self.table[f"{label}_before"].append(bftable)
+                self.loss_table[f"{label}_before"].append(bfloss_table)
+                
+                
+                if self.args.visible:
+                    self.viz.line(
+                        [acc_before],
+                        [self.current_epoch],
+                        win=self.viz_win_name,
+                        update="append",
+                        name=f"{label}_acc(before)",
+                        opts=dict(
+                            title=self.viz_win_name,
+                            xlabel="Communication Rounds",
+                            ylabel="Accuracy",
+                        ),
+                    )
+                    self.viz.line(
+                        [acc_after],
+                        [self.current_epoch],
+                        win=self.viz_win_name,
+                        update="append",
+                        name=f"{label}_acc(after)",
+                    )
+
+    def run(self):  
+        if self.trainer is None:
+            raise RuntimeError(
+                "Specify your unique trainer or set `default_trainer` as True."
+            )
+        if self.args.visible:
+            self.viz.close(win=self.viz_win_name)
+        self.train()
+
+        self.logger.log(
+            "=" * 20, self.algo, "TEST RESULTS:", "=" * 20, self.test_results
+        )
+        self.check_convergence()
+
+        # save log files
+        if not os.path.isdir(OUT_DIR /  self.args.dataset / self.algo) and (
+            self.args.save_log or self.args.save_fig or self.args.save_metrics
+        ):
+            os.makedirs(OUT_DIR /  self.args.dataset / self.algo, exist_ok=True)
+
+        if self.args.save_log:
+            self.logger.save_text(OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_log.html")
+
+        if self.args.save_metrics:
+            import pandas as pd
+            import numpy as np
+
+            accuracies = []
+            labels = []
+            for label, acc in self.metrics.items():
+                if len(acc) > 0:
+                    accuracies.append(np.array(acc).T)
+                    labels.append(label)
+            pd.DataFrame(np.stack(accuracies, axis=1), columns=labels).to_csv(
+                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_acc_metrics.csv",
+                index=False,
             )
             
-        return {
-            "train_loss": train_loss,
-            "test_loss": test_loss,
-            "train_correct": train_correct,
-            "test_correct": test_correct,
-            "val_correct": val_correct,
-            "val_loss": val_loss,
-            "train_size": float(max(1, train_sample_num)),
-            "test_size": float(max(1, test_sample_num)),
-            "val_size": float(max(1, val_sample_num)),
-        }
+            losses = []
+            labels = []
+            for label, loss in self.loss_metrics.items():
+                if len(loss) > 0:
+                    losses.append(np.array(loss).T)
+                    labels.append(label)
+            pd.DataFrame(np.stack(losses, axis=1), columns=labels).to_csv(
+                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_loss_metrics.csv",
+                index=False,
+            )
+            
+            # ADD
+            for label, acc in self.table.items():
+                if 'after' in label:
+                    pd.DataFrame(np.array(self.table[label][1:])).to_csv(
+                            OUT_DIR /  self.args.dataset/ self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_acc_metrics.csv",
+                            index=False,
+                        )
+            for label, acc in self.loss_table.items():
+                if 'after' in label:
+                    pd.DataFrame(np.array(self.loss_table[label][1:])).to_csv(
+                            OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_loss_metrics.csv",
+                            index=False,
+                        )
+                
+        if self.args.save_fig and (self.args.global_epoch != 0):
+            import matplotlib
+            from matplotlib import pyplot as plt
 
-    def test(
-        self, client_id: int, new_parameters: OrderedDict[str, torch.nn.Parameter]
-    ):
-        self.client_id = client_id
-        self.load_dataset()
-        self.set_parameters(new_parameters)
+            matplotlib.use("Agg")
+            linestyle = {
+                "test_before": "solid",
+                "test_after": "solid",
+                "train_before": "dotted",
+                "train_after": "dotted",
+                "val_before": "dashed",
+                "val_after": "dashed",
+            }
+            for label, acc in self.metrics.items():
+                if len(acc) > 0:
+                    plt.plot(acc, label=label, ls=linestyle[label])
+            plt.title(f"{self.algo} {self.args.dataset} acc")
+            plt.ylim(0, 100)
+            plt.xlabel("Communication Rounds")
+            plt.ylabel("Accuracy")
+            plt.grid()
+            plt.legend()
+            plt.savefig(
+                OUT_DIR / self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_acc.jpeg", bbox_inches="tight"
+            )
+            plt.clf()
+            _min, _max = 1e+4, 0
+            for label, loss in self.loss_metrics.items():
+                if len(loss) > 0:
+                    cur_min_loss, cur_max_loss = np.min(loss), np.max(loss)
+                    plt.plot(loss, label=label, ls=linestyle[label])
+                    _min, _max = min(_min, cur_min_loss), max(_max, cur_max_loss)
+                    
+            plt.title(f"{self.algo} {self.args.dataset} loss")
 
-        before = {
-            "train_loss": 0,
-            "train_correct": 0,
-            "train_size": 1.0,
-            "test_loss": 0,
-            "test_correct": 0,
-            "test_size": 1.0,
-            "val_loss": 0,
-            "val_correct": 0,
-            "val_size": 1.0,
-        }
-        after = deepcopy(before)
+            plt.axis('auto')
+            
+            plt.xlabel("Communication Rounds")
+            plt.ylabel("Loss")
+            plt.grid()
+            plt.legend()
+            plt.savefig(
+                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_loss.jpeg", bbox_inches="tight"
+            )
+            plt.clf()
+            
+            gr = self.args.global_epoch
+            le = self.args.local_epoch
+            for label, acc in self.table.items():
+                if len(acc) > 0:
+                    acc = np.array(self.table[label][1:])
+                    acc = np.where(acc == 0, np.nan, acc)
+                    acc = pd.DataFrame(acc)
+                    acc = acc.T.agg(['mean', 'std'])
+                    plt.plot(np.linspace(1, gr*le, num=int(gr)-1), acc.iloc[0], ls=linestyle[label], label=label)
+                    plt.fill_between(np.linspace(1, gr*le, num=int(gr)-1), acc.iloc[0] - acc.iloc[1],  acc.iloc[0] + acc.iloc[1], alpha=0.2)
+            plt.legend()
+            plt.title(f"{self.algo} {self.args.dataset} {'personal acc'}")
+            plt.ylim(0, 100)
+            plt.xlabel("# of global rounds * # of local epochs")
+            plt.ylabel(f"GR:{gr}, LE{le} Accuracy")
+            plt.grid()
+            plt.legend()
+            plt.savefig(
+                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_Clients_acc.jpeg", bbox_inches="tight"
+            )
+            plt.clf()
+            _min, _max = 1e+4, 0
+            for label, loss in self.loss_table.items():
+                if len(loss) > 0:
+                    loss = np.array(self.loss_table[label][1:])
+                    loss = np.where(loss == 0, np.nan, loss)
+                    cur_min_loss, cur_max_loss = np.min(loss), np.max(loss)
+                    loss = pd.DataFrame(loss)
+                    loss = loss.T.agg(['mean', 'std'])
+                    plt.plot(np.linspace(1, gr*le, num=int(gr)-1), loss.iloc[0], ls=linestyle[label], label=label)
+                    plt.fill_between(np.linspace(1, gr*le, num=int(gr)-1), 
+                                        loss.iloc[0] - loss.iloc[1], loss.iloc[0] + loss.iloc[1], alpha=0.2)
+                    _min, _max = min(_min, cur_min_loss), max(_max, cur_max_loss)
+            plt.legend()
+            plt.title(f"{self.algo} {self.args.dataset} {'personal loss'}")
+            plt.axis('auto')
 
-        before = self.evaluate()
-        if self.args.finetune_epoch > 0:
-            self.finetune()
-            after = self.evaluate()
-        return {"before": before, "after": after}
+            plt.xlabel("# of global rounds * # of local epochs")
+            plt.ylabel(f"GR:{gr}, LE{le} Loss")
+            plt.grid()
+            plt.legend()
+            plt.savefig(
+                OUT_DIR / self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_Clients_loss.jpeg", bbox_inches="tight"
+            )
+            plt.clf()
+        
 
-    def finetune(self):
-        self.model.train()
-        for _ in range(self.args.finetune_epoch):
-            for x, y in self.trainloader:
-                if len(x) <= 1:
-                    continue
-                x, y = x.to(self.device), y.to(self.device)
-                logit = self.model(x)
-                loss = self.criterion(logit, y)
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+        # save trained model(s)
+        if self.args.save_model:
+            model_name = (
+                f"{self.args.dataset}_{self.args.global_epoch}_{self.args.model}_{self.args.ab}.pt"
+            )
+            if self.unique_model:
+                torch.save(
+                    self.client_trainable_params, OUT_DIR / self.algo / model_name
+                )
+            else:
+                torch.save(self.model.state_dict(), OUT_DIR / self.algo / model_name)
 
-    def fit(self):
-        self.model.train()
-        for _ in range(self.local_epoch):
-            for x, y in self.trainloader:
-                # When the current batch size is 1, the batchNorm2d modules in the model would raise error.
-                # So the latent size 1 data batches are discarded.
-                if len(x) <= 1:
-                    continue
-                x, y = x.to(self.device), y.to(self.device)
-                logit = self.model(x)
-                loss = self.criterion(logit, y)
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+
+if __name__ == "__main__":
+    server = FedAvgServer()
+    server.run()
+    
