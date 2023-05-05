@@ -56,11 +56,13 @@ class PeacocServer(FedAvgServer):
             ]
         self.output_betagFval = deepcopy(self.model)
         self.T = self.args.temperature #wandb.config.T #
-        self.prealpha = self.args.lmb
-        self.alpha = self.softmaxwT(self.prealpha, self.T)  # torch.FloatTensor([1 / self.client_num_in_total] * self.client_num_in_total)
+        self.prealpha = torch.FloatTensor(self.args.lmb)
+        self.soft = torch.nn.Softmax(dim=0)
+        self.alpha = self.soft(self.prealpha/self.T)  # torch.FloatTensor([1 / self.client_num_in_total] * self.client_num_in_total)
+        # self.alpha = self.softmaxwT(self.prealpha, self.T)  # torch.FloatTensor([1 / self.client_num_in_total] * self.client_num_in_total)
         self.ga = torch.FloatTensor([0] * self.client_num_in_total)
         self.global_lr = self.args.global_lr # wandb.config.glr
-        self.alpha_list, self.ga_list, self.prealpha_list, self.beta_list, self.gb_list, self.norm1_list, self.norm2_list  = [], [], [], [], [], [], []
+        self.alpha_list, self.ga_list, self.prealpha_list, self.beta_list, self.gb_list, self.gFtr0_list, self.agg_beta, self.norm1_list, self.norm2_list  = [], [], [], [], [], [], [], [], []
         self.num_list = list(range(self.client_num_in_total))
         self.beta_dict = {i: {} for i in range(self.args.global_epoch)}
         self.gb_dict = {i: {} for i in range(self.args.global_epoch)}
@@ -141,15 +143,27 @@ class PeacocServer(FedAvgServer):
             torch.sum(beta_weight_cache * torch.stack(diff, dim=-1), dim=-1)
             for diff in zip(*gFval_params_cache)
         ]
+        norm2_list = torch.FloatTensor([0] * self.client_num_in_total)
+        for idx, diff in enumerate(gFval_params_cache):
+            params = [item for item in diff]
+            params2 = beta_weight_cache[idx] * torch.cat([torch.flatten(torch.Tensor(p)) for p in params])
+            norm2 = torch.linalg.norm(params2).reshape(1, -1).item()
+            # print(norm2, idx, beta_weight_cache[idx], client_ids[idx], self.trainer.beta_dict, beta_weight_cache)
+            norm2_list[client_ids[idx]] = norm2
+        self.agg_beta.append(norm2_list.clone().to('cpu').tolist())
+        norm1_list = torch.FloatTensor([0] * self.client_num_in_total)
         if self.args.ab == 'a' or self.args.ab == 'B': 
             ## sum beta * gFval_i
             for idx, client_id in enumerate(client_ids):
-                cos = multiply_model(gFtrg_params_cache[idx], aggregated_betagFval)
-                self.ga[client_id] =  -cos/self.trainer.nlayers * self.args.local_lr * self.args.global_lr * 1e+4
+                cos, norm1, _ = multiply_model(gFtrg_params_cache[idx], aggregated_betagFval, normalize=True)
+                self.ga[client_id] = cos
+                norm1_list[client_id] = norm1
+            self.ga = -self.ga * self.args.local_lr * self.args.global_lr * 1e+4
             self.ga = normalize(self.ga, p=1.0, dim = 0)
-            # Calculate alpha
-            self.prealpha = self.alpha - (1/self.T) * self.ga * self.softmaxwT(self.alpha, self.T) * (1-self.softmaxwT(self.alpha,  self.T)) * 1e+4
-            self.alpha = self.softmaxwT(self.prealpha, self.T) 
+            self.prealpha = self.alpha - (1/self.T) * self.ga * self.soft(self.alpha/self.T) * (1-self.soft(self.alpha/self.T))
+            self.alpha = self.soft(self.prealpha/self.T) 
+
+        self.gFtr0_list.append(norm1_list.clone().to('cpu').tolist())
             
         cur_alpha = torch.index_select(self.alpha, 0, torch.as_tensor(client_ids)).to(self.device)
         aggregated_delta = [
@@ -178,7 +192,8 @@ class PeacocServer(FedAvgServer):
 
         wandb_params_dict = {'beta':self.beta_list, 'gb':self.gb_list, 
                                 'alpha':self.alpha_list, 'ga':self.ga_list, 'pre_alpha':self.prealpha_list, 
-                                'theta_0-theta_i':self.norm1_list, 'gFval_i':self.norm2_list,}
+                                'theta_0-theta_i':self.norm1_list, 'gFval_i':self.norm2_list, 'gFtr0': self.gFtr0_list, 
+                                'beta_gFval':self.agg_beta}
         keys = ['client {}'.format(client_id) for client_id in self.num_list]
         for key, value in wandb_params_dict.items():
             wandb.log({key: 

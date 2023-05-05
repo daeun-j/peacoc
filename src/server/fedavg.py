@@ -177,7 +177,8 @@ class FedAvgServer:
         self.args.lmb = normalize(self.args.lmb, p=1.0, dim = 0) #self.args.lmb**2
         self.args.invlmb = 1/(self.args.lmb)#1/(self.args.lmb**2)
         self.args.invlmb = normalize(self.args.invlmb, p=1.0, dim = 0)
-
+        # set init beta from beysian optmizer
+        self.args.invlmb = torch.Tensor([1e-4, 1e-5, 5e-6,  5e-7, 1e-8, 1e-4, 1e-5, 5e-6,  5e-7, 1e-8])
     
     def train(self):
         for E in self.train_progress_bar:
@@ -428,7 +429,7 @@ class FedAvgServer:
             os.makedirs(OUT_DIR /  self.args.dataset / self.algo, exist_ok=True)
 
         if self.args.save_log:
-            self.logger.save_text(OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_log.html")
+            self.logger.save_text(OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_log.html")
 
         if self.args.save_metrics:
             import pandas as pd
@@ -441,7 +442,7 @@ class FedAvgServer:
                     accuracies.append(np.array(acc).T)
                     labels.append(label)
             pd.DataFrame(np.stack(accuracies, axis=1), columns=labels).to_csv(
-                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_acc_metrics.csv",
+                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_acc_metrics.csv",
                 index=False,
             )
             
@@ -452,7 +453,7 @@ class FedAvgServer:
                     losses.append(np.array(loss).T)
                     labels.append(label)
             pd.DataFrame(np.stack(losses, axis=1), columns=labels).to_csv(
-                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_loss_metrics.csv",
+                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_loss_metrics.csv",
                 index=False,
             )
             
@@ -460,13 +461,13 @@ class FedAvgServer:
             for label, acc in self.table.items():
                 if 'after' in label:
                     pd.DataFrame(np.array(self.table[label][1:])).to_csv(
-                            OUT_DIR /  self.args.dataset/ self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_acc_metrics.csv",
+                            OUT_DIR /  self.args.dataset/ self.algo / f"client_gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_{label}_acc_metrics.csv",
                             index=False,
                         )
             for label, acc in self.loss_table.items():
                 if 'after' in label:
                     pd.DataFrame(np.array(self.loss_table[label][1:])).to_csv(
-                            OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_client_{label}_loss_metrics.csv",
+                            OUT_DIR /  self.args.dataset / self.algo / f"client_gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_{label}_loss_metrics.csv",
                             index=False,
                         )
                 
@@ -493,7 +494,7 @@ class FedAvgServer:
             plt.grid()
             plt.legend()
             plt.savefig(
-                OUT_DIR / self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_acc.jpeg", bbox_inches="tight"
+                OUT_DIR / self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_acc.jpeg", bbox_inches="tight"
             )
             plt.clf()
             _min, _max = 1e+4, 0
@@ -512,68 +513,68 @@ class FedAvgServer:
             plt.grid()
             plt.legend()
             plt.savefig(
-                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_loss.jpeg", bbox_inches="tight"
+                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_loss.jpeg", bbox_inches="tight"
             )
             plt.clf()
             
             gr = self.args.global_epoch
             le = self.args.local_epoch
-            for label, acc in self.table.items():
-                if len(acc) > 0:
-                    acc = np.array(self.table[label][1:])
-                    acc = np.where(acc == 0, np.nan, acc)
-                    acc = pd.DataFrame(acc)
-                    acc = acc.T.agg(['mean', 'std'])
-                    plt.plot(np.linspace(1, gr*le, num=int(gr)-1), acc.iloc[0], ls=linestyle[label], label=label)
-                    plt.fill_between(np.linspace(1, gr*le, num=int(gr)-1), acc.iloc[0] - acc.iloc[1],  acc.iloc[0] + acc.iloc[1], alpha=0.2)
-            plt.legend()
-            plt.title(f"{self.algo} {self.args.dataset} {'personal acc'}")
-            plt.ylim(0, 100)
-            plt.xlabel("# of global rounds * # of local epochs")
-            plt.ylabel(f"GR:{gr}, LE{le} Accuracy")
-            plt.grid()
-            plt.legend()
-            plt.savefig(
-                OUT_DIR /  self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_Clients_acc.jpeg", bbox_inches="tight"
-            )
-            plt.clf()
-            _min, _max = 1e+4, 0
-            for label, loss in self.loss_table.items():
-                if len(loss) > 0:
-                    loss = np.array(self.loss_table[label][1:])
-                    loss = np.where(loss == 0, np.nan, loss)
-                    cur_min_loss, cur_max_loss = np.min(loss), np.max(loss)
-                    loss = pd.DataFrame(loss)
-                    loss = loss.T.agg(['mean', 'std'])
-                    plt.plot(np.linspace(1, gr*le, num=int(gr)-1), loss.iloc[0], ls=linestyle[label], label=label)
-                    plt.fill_between(np.linspace(1, gr*le, num=int(gr)-1), 
-                                        loss.iloc[0] - loss.iloc[1], loss.iloc[0] + loss.iloc[1], alpha=0.2)
-                    _min, _max = min(_min, cur_min_loss), max(_max, cur_max_loss)
-            plt.legend()
-            plt.title(f"{self.algo} {self.args.dataset} {'personal loss'}")
-            plt.axis('auto')
+        #     for label, acc in self.table.items():
+        #         if len(acc) > 0:
+        #             acc = np.array(self.table[label][1:])
+        #             acc = np.where(acc == 0, np.nan, acc)
+        #             acc = pd.DataFrame(acc)
+        #             acc = acc.T.agg(['mean', 'std'])
+        #             plt.plot(np.linspace(1, gr*le, num=int(gr)-1), acc.iloc[0], ls=linestyle[label], label=label)
+        #             plt.fill_between(np.linspace(1, gr*le, num=int(gr)-1), acc.iloc[0] - acc.iloc[1],  acc.iloc[0] + acc.iloc[1], alpha=0.2)
+        #     plt.legend()
+        #     plt.title(f"{self.algo} {self.args.dataset} {'personal acc'}")
+        #     plt.ylim(0, 100)
+        #     plt.xlabel("# of global rounds * # of local epochs")
+        #     plt.ylabel(f"GR:{gr}, LE{le} Accuracy")
+        #     plt.grid()
+        #     plt.legend()
+        #     plt.savefig(
+        #         OUT_DIR /  self.args.dataset / self.algo / f"Clients_gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_acc.jpeg", bbox_inches="tight"
+        #     )
+        #     plt.clf()
+        #     _min, _max = 1e+4, 0
+        #     for label, loss in self.loss_table.items():
+        #         if len(loss) > 0:
+        #             loss = np.array(self.loss_table[label][1:])
+        #             loss = np.where(loss == 0, np.nan, loss)
+        #             cur_min_loss, cur_max_loss = np.min(loss), np.max(loss)
+        #             loss = pd.DataFrame(loss)
+        #             loss = loss.T.agg(['mean', 'std'])
+        #             plt.plot(np.linspace(1, gr*le, num=int(gr)-1), loss.iloc[0], ls=linestyle[label], label=label)
+        #             plt.fill_between(np.linspace(1, gr*le, num=int(gr)-1), 
+        #                                 loss.iloc[0] - loss.iloc[1], loss.iloc[0] + loss.iloc[1], alpha=0.2)
+        #             _min, _max = min(_min, cur_min_loss), max(_max, cur_max_loss)
+        #     plt.legend()
+        #     plt.title(f"{self.algo} {self.args.dataset} {'personal loss'}")
+        #     plt.axis('auto')
 
-            plt.xlabel("# of global rounds * # of local epochs")
-            plt.ylabel(f"GR:{gr}, LE{le} Loss")
-            plt.grid()
-            plt.legend()
-            plt.savefig(
-                OUT_DIR / self.args.dataset / self.algo / f"gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.args.ab}_{self.fn}_Clients_loss.jpeg", bbox_inches="tight"
-            )
-            plt.clf()
+        #     plt.xlabel("# of global rounds * # of local epochs")
+        #     plt.ylabel(f"GR:{gr}, LE{le} Loss")
+        #     plt.grid()
+        #     plt.legend()
+        #     plt.savefig(
+        #         OUT_DIR / self.args.dataset / self.algo / f"Clients_gr{self.args.global_epoch}_le{self.args.local_epoch}_{self.fn}_{self.args.ab}_loss.jpeg", bbox_inches="tight"
+        #     )
+        #     plt.clf()
         
 
-        # save trained model(s)
-        if self.args.save_model:
-            model_name = (
-                f"{self.args.dataset}_{self.args.global_epoch}_{self.args.model}_{self.args.ab}.pt"
-            )
-            if self.unique_model:
-                torch.save(
-                    self.client_trainable_params, OUT_DIR / self.algo / model_name
-                )
-            else:
-                torch.save(self.model.state_dict(), OUT_DIR / self.algo / model_name)
+        # # save trained model(s)
+        # if self.args.save_model:
+        #     model_name = (
+        #         f"{self.args.dataset}_{self.args.global_epoch}_{self.args.model}_{self.args.ab}.pt"
+        #     )
+        #     if self.unique_model:
+        #         torch.save(
+        #             self.client_trainable_params, OUT_DIR / self.algo / model_name
+        #         )
+        #     else:
+        #         torch.save(self.model.state_dict(), OUT_DIR / self.algo / model_name)
 
 
 if __name__ == "__main__":
