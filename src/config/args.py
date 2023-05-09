@@ -61,8 +61,8 @@ def get_fedavg_argparser() -> ArgumentParser:
     parser.add_argument("-dn", type = str, default = 'test')
     parser.add_argument("-count", type = int, default = 1)
     parser.add_argument("-ab", type=str, default="B") 
-    parser.add_argument("-lmb", type=int, default=[])
-    parser.add_argument("-invlmb", type=int, default=[])
+    parser.add_argument("-lmb", type=list, default=[])
+    parser.add_argument("-invlmb", nargs='+', default=["0.0009", "0.0008", "0.0007", "0.0006", "0.0005"])
     parser.add_argument("-eval_model", type=int, default=0) # eval model 0 = self.model, else eval model 1 = self.pers_model
     parser.add_argument("-fn", type=str, default='test') # filename
     # ablation a: learning alpha only, b: leaning beta only, N: leaning neither, B: leanring both hyperparams
@@ -70,13 +70,8 @@ def get_fedavg_argparser() -> ArgumentParser:
 
 def get_peacoc_argparser() -> ArgumentParser:
     parser = get_fedavg_argparser()
-
-    parser.add_argument("--pers_epoch", type=int, default=2)
-    parser.add_argument("--lamda", type=float, default=0.1)
-    parser.add_argument("--global_lr", type=float, default=1)
+    parser.add_argument("-glr", "--global_lr", type=float, default=1)
     parser.add_argument("-T", "--temperature", type=float, default=10.0)
-    parser.add_argument("-ga_lr", type = int, default = 1) #1e+4
-    parser.add_argument('-gb_lr', type=float, default = 20)
     return parser
 
 def get_ditto_argparser() -> ArgumentParser:
