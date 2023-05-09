@@ -1,297 +1,192 @@
+import json
+import os
+import pickle
 import random
-from collections import Counter
-from typing import Dict, List, Tuple
+from argparse import ArgumentParser
 
+import torch
 import numpy as np
-from torch.utils.data import Dataset
-import math
+from path import Path
 
-# level5_iid_partition with same valication
-def iid_partition(
-    ori_dataset: Dataset, num_clients: int, num_val: int
-) -> Tuple[List[List[int]], Dict, int]:
+from datasets import DATASETS
+from partition import dirichlet, iid_partition, randomly_assign_classes, allocate_shards
+from util import prune_args, generate_synthetic_data, process_celeba, process_femnist
+from sklearn.model_selection import train_test_split
+
+_CURRENT_DIR = Path(__file__).parent.abspath()
+
+
+def main(args):
+    dataset_root = _CURRENT_DIR.parent / args.dataset
+
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if not os.path.isdir(dataset_root):
+        os.mkdir(dataset_root)
+
     partition = {"separation": None, "data_indices": None}
-    stats = {}
-    data_indices = [[] for _ in range(num_clients)]
-    targets_numpy = np.array(ori_dataset.targets, dtype=np.int64)
-    idx = list(range(len(targets_numpy)))
-    random.shuffle(idx)
-    idx, idx_val = idx[num_val:], idx[:num_val]
-    num_levels = 5
-    sum_lebels = np.sum(list(range(num_levels+1)))
-    size = int(len(idx) / num_clients / sum_lebels * num_levels)
-    front_idx = 0
-    for i in range(num_clients):
-        if i %5 == 0:
-            id = i %5
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 1:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 2:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 3:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 4:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        # print(i,i %5 , front_idx, len(data_indices[i]))
+
+    if args.dataset == "femnist":
+        partition, stats = process_femnist(args)
+    elif args.dataset == "celeba":
+        partition, stats = process_celeba(args)
+    elif args.dataset == "synthetic":
+        partition, stats = generate_synthetic_data(args)
+    else:  # MEDMNIST, COVID, MNIST, CIFAR10, ...
+        ori_dataset = DATASETS[args.dataset](dataset_root, args)
+
+        if not args.iid:
+            if args.alpha > 0:  # Dirichlet(alpha)
+                partition, stats = dirichlet(
+                    ori_dataset=ori_dataset,
+                    num_clients=args.client_num_in_total,
+                    alpha=args.alpha,
+                    least_samples=args.least_samples,
+                )
+            elif args.classes != 0:  # randomly assign classes
+                args.classes = max(1, min(args.classes, len(ori_dataset.classes)))
+                partition, stats = randomly_assign_classes(
+                    ori_dataset=ori_dataset,
+                    num_clients=args.client_num_in_total,
+                    num_classes=args.classes,
+                )
+            elif args.shards > 0:  # allocate shards
+                partition, stats = allocate_shards(
+                    ori_dataset=ori_dataset,
+                    num_clients=args.client_num_in_total,
+                    num_shards=args.shards,
+                )
+            else:
+                raise RuntimeError(
+                    "Please set arbitrary one arg from [--alpha, --classes, --shards] to split the dataset."
+                )
+
+        else:  # iid partition
+            partition, stats, idx_val = iid_partition(
+                ori_dataset=ori_dataset, num_clients=args.client_num_in_total, num_val = args.num_val
+            )
+
+    if partition["separation"] is None:
+        if args.split == "user":
+            train_clients_num = int(args.client_num_in_total * args.fraction)
+            clients_4_train, clients_4_val = train_test_split(list(range(train_clients_num)), test_size=0.5)
+            clients_4_test = list(range(train_clients_num, args.client_num_in_total))
+            # clients_4_train = list(range(train_clients_num))
+        else:
+            clients_4_train = list(range(args.client_num_in_total))
+            # clients_4_train, clients_4_val = train_test_split(list(range(args.client_num_in_total)), test_size=0.2)
+            clients_4_test = list(range(args.client_num_in_total))
+            clients_4_val = list(range(args.client_num_in_total))
+
+        partition["separation"] = {
+            "train": clients_4_train,
+            "test": clients_4_test,
+            "val": clients_4_val,
+            "total": args.client_num_in_total,
+        }
+
+    if args.dataset not in ["femnist", "celeba"]:
+        for client_id, idx in enumerate(partition["data_indices"]):
+            if args.split == "sample":
+                num_train_samples = int(len(idx) * args.fraction)
+                np.random.shuffle(idx)
+                idx_train, idx_test = idx[:num_train_samples], idx[num_train_samples:]
+                num_test_samples = int(len(idx_test) * args.fraction)
+                idx_val, idx_test  = idx_test[:num_test_samples], idx_test[num_test_samples:]
+                partition["data_indices"][client_id] = {
+                    "train": idx_train,
+                    "test": idx_test,
+                    "val": idx_val,
+                }
+            elif args.split == "peacoc":
+                num_train_samples = int(len(idx) * args.fraction)
+                np.random.shuffle(idx)
+                idx_train, idx_test = idx[:num_train_samples], idx[num_train_samples:]
+                # num_test_samples = int(len(idx_test) * args.fraction)
+                # idx_val, idx_test  = idx_test[:num_test_samples], idx_test[num_test_samples:]
+                partition["data_indices"][client_id] = {
+                    "train": idx_train,
+                    "test": idx_test,
+                    "val": idx_val,
+                }
+                print(len(idx_train), len(idx_test), len(idx_val), client_id)
+            else:
+                idx, idx_val = train_test_split(idx, test_size=0.2)
+                if client_id in clients_4_train:
+                    partition["data_indices"][client_id] = {"train": idx, "test": [], "val": idx_val}
+                else:
+                    partition["data_indices"][client_id] = {"train": [], "test": idx, "val": idx_val}
+
+    with open(_CURRENT_DIR.parent / args.dataset / "partition.pkl", "wb") as f:
+        pickle.dump(partition, f)
+
+    with open(_CURRENT_DIR.parent / args.dataset / "all_stats.json", "w") as f:
+        json.dump(stats, f)
+
+    with open(_CURRENT_DIR.parent / args.dataset / "args.json", "w") as f:
+        json.dump(prune_args(args), f)
 
 
-    num_samples = np.array(list(map(lambda stat_i: stat_i["x"], stats.values())))
-    stats["sample per client"] = {
-        "std": num_samples.mean(),
-        "stddev": num_samples.std(),
-    }
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument(
+        "-d",
+        "--dataset",
+        type=str,
+        choices=[
+            "mnist",
+            "cifar10",
+            "cifar10",
+            "cifar100",
+            "synthetic",
+            "femnist",
+            "emnist",
+            "fmnist",
+            "celeba",
+            "medmnistS",
+            "medmnistA",
+            "medmnistC",
+            "covid19",
+            "svhn",
+            "usps",
+            "tiny_imagenet",
+            "cinic10",
+        ],
+        default="cifar10",
+    )
+    parser.add_argument("--iid", type=int, default=1)
+    parser.add_argument("--num_val", type=int, default=1000)
+    
+    parser.add_argument("-cn", "--client_num_in_total", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--split", type=str, choices=["sample", "user", "peacoc"], default="peacoc"
+    )
+    parser.add_argument("--fraction", type=float, default=0.8)
+    # For random assigning classes only
+    parser.add_argument("-c", "--classes", type=int, default=0)
+    # For allocate shards only
+    parser.add_argument("-s", "--shards", type=int, default=0)
+    # For dirichlet distribution only
+    parser.add_argument("-a", "--alpha", type=float, default=0)
+    parser.add_argument("-ls", "--least_samples", type=int, default=4)
 
-    partition["data_indices"] = data_indices
+    # For synthetic data only
+    parser.add_argument("--gamma", type=float, default=0.5)
+    parser.add_argument("--beta", type=float, default=0.5)
+    parser.add_argument("--dimension", type=int, default=60)
 
-    return partition, stats, idx_val
+    # For CIFAR-100 only
+    parser.add_argument("--super_class", type=int, default=0)
 
-
-# level5_iid_partition
-def level5_iid_partition(
-    ori_dataset: Dataset, num_clients: int
-) -> Tuple[List[List[int]], Dict]:
-    partition = {"separation": None, "data_indices": None}
-    stats = {}
-    data_indices = [[] for _ in range(num_clients)]
-    targets_numpy = np.array(ori_dataset.targets, dtype=np.int64)
-    idx = list(range(len(targets_numpy)))
-    random.shuffle(idx)
-    idx, idx_val = idx[5000:], idx[:5000]
-    num_levels = 5
-    sum_lebels = np.sum(list(range(num_levels+1)))
-    size = int(len(idx) / num_clients / sum_lebels * num_levels)
-    front_idx = 0
-    for i in range(num_clients):
-        if i %5 == 0:
-            id = i %5
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 1:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 2:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 3:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 4:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        # print(i,i %5 , front_idx, len(data_indices[i]))
-
-
-    num_samples = np.array(list(map(lambda stat_i: stat_i["x"], stats.values())))
-    stats["sample per client"] = {
-        "std": num_samples.mean(),
-        "stddev": num_samples.std(),
-    }
-
-    partition["data_indices"] = data_indices
-
-    return partition, stats, idx_val
-
-
-# level5_iid_partition
-def level5_iid_partition(
-    ori_dataset: Dataset, num_clients: int
-) -> Tuple[List[List[int]], Dict]:
-    partition = {"separation": None, "data_indices": None}
-    stats = {}
-    data_indices = [[] for _ in range(num_clients)]
-    targets_numpy = np.array(ori_dataset.targets, dtype=np.int64)
-    idx = list(range(len(targets_numpy)))
-    random.shuffle(idx)
-    num_levels = 5
-    sum_lebels = np.sum(list(range(num_levels+1)))
-    size = int(len(idx) / num_clients / sum_lebels * num_levels)
-    front_idx = 0
-    for i in range(num_clients):
-        if i %5 == 0:
-            id = i %5
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 1:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 2:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 3:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        elif i %5 == 4:
-            id = i %5
-            
-            data_indices[i] = idx[front_idx : front_idx + size * (id + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-            front_idx += size * (id + 1)
-            
-        # print(i,i %5 , front_idx, len(data_indices[i]))
-
-
-    num_samples = np.array(list(map(lambda stat_i: stat_i["x"], stats.values())))
-    stats["sample per client"] = {
-        "std": num_samples.mean(),
-        "stddev": num_samples.std(),
-    }
-
-    partition["data_indices"] = data_indices
-
-    return partition, stats
-
-
-def level3_iid_partition(
-    ori_dataset: Dataset, num_clients: int
-) -> Tuple[List[List[int]], Dict]:
-    partition = {"separation": None, "data_indices": None}
-    stats = {}
-    data_indices = [[] for _ in range(num_clients)]
-    targets_numpy = np.array(ori_dataset.targets, dtype=np.int64)
-    idx = list(range(len(targets_numpy)))
-    random.shuffle(idx)
-    size = int(len(idx) / num_clients)
-
-    for i in range(num_clients):
-        # data_indices[i] = idx[size * i : size * (i + 1)]
-        # stats[i] = {"x": None, "y": None}
-        # stats[i]["x"] = len(data_indices[i])
-        # stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-        if i %3 == 0:
-            data_indices[i] = idx[size * i :  math.floor(size * (i + 0.1))]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-        if i %3 == 1:
-            data_indices[i] = idx[size * i : math.floor(size * (i + 0.01))]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-        if i %3 == 2:
-            data_indices[i] = idx[size * i : size * (i + 1)]
-            stats[i] = {"x": None, "y": None}
-            stats[i]["x"] = len(data_indices[i])
-            stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-
-    num_samples = np.array(list(map(lambda stat_i: stat_i["x"], stats.values())))
-    stats["sample per client"] = {
-        "std": num_samples.mean(),
-        "stddev": num_samples.std(),
-    }
-
-    partition["data_indices"] = data_indices
-
-    return partition, stats
-
-def iid_partition_old(
-    ori_dataset: Dataset, num_clients: int
-) -> Tuple[List[List[int]], Dict]:
-    partition = {"separation": None, "data_indices": None}
-    stats = {}
-    data_indices = [[] for _ in range(num_clients)]
-    targets_numpy = np.array(ori_dataset.targets, dtype=np.int64)
-    idx = list(range(len(targets_numpy)))
-    random.shuffle(idx)
-    size = int(len(idx) / num_clients)
-
-    for i in range(num_clients):
-        data_indices[i] = idx[size * i : size * (i + 1)]
-        stats[i] = {"x": None, "y": None}
-        stats[i]["x"] = len(data_indices[i])
-        stats[i]["y"] = Counter(targets_numpy[data_indices[i]].tolist())
-
-    num_samples = np.array(list(map(lambda stat_i: stat_i["x"], stats.values())))
-    stats["sample per client"] = {
-        "std": num_samples.mean(),
-        "stddev": num_samples.std(),
-    }
-
-    partition["data_indices"] = data_indices
-
-    return partition, stats
+    # For EMNIST only
+    parser.add_argument(
+        "--emnist_split",
+        type=str,
+        choices=["byclass", "bymerge", "letters", "balanced", "digits", "mnist"],
+        default="byclass",
+    )
+    args = parser.parse_args()
+    main(args)
