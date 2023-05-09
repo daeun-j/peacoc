@@ -1,231 +1,151 @@
-from argparse import Namespace
-from copy import deepcopy
+from copy import deepcopy, copy
+from typing import Dict, OrderedDict
 
-from fedavg import FedAvgServer
-from src.config.args import get_peacoc_argparser
-from src.config.models import MODEL_DICT
-from src.client.peacoc import PeacocClient
 import torch
-from src.config.utils import *
-import torch.nn as nn
-import ast
-import wandb 
-from argparse import ArgumentParser
-from src.config.args import get_fedavg_argparser
-from torch.nn.functional import normalize
-import gc
 
-class PeacocServer(FedAvgServer):
-    def __init__(
+from fedavg import FedAvgClient
+from src.config.utils import *
+import gc
+from torch.optim import SGD
+
+
+torch.autograd.set_detect_anomaly(True)
+
+class PeacocClient(FedAvgClient):
+    def __init__(self, model, args, logger, client_num, pers_m, gFval_m, gFtrg_m):
+        super().__init__(model, args, logger)
+        self.pers_model = deepcopy(model) # theta_i
+        self.gFval_pers_model = deepcopy(model) # init gradient of F val personal model
+        self.gFtrg_pers_model = deepcopy(model) # init gradient of F train global model
+        self.norm1, self.norm2 = torch.FloatTensor([0]), torch.FloatTensor([0])
+        self.personal_params_dict = {
+            cid: deepcopy(self.pers_model.state_dict()) for cid in range(client_num)
+        }
+        self.optimizer.add_param_group(
+            {"params": trainable_params(self.pers_model), "lr": self.local_lr}
+        ) 
+
+        self.gFval_pers_model_params_dict = {
+            cid: deepcopy(self.gFval_pers_model.state_dict()) for cid in range(client_num)
+        }
+        self.gFtrg_pers_model_params_dict = {
+            cid: deepcopy(self.gFtrg_pers_model.state_dict()) for cid in range(client_num)
+        }
+
+        self.beta, self.gb = torch.tensor([0]), torch.tensor([0])
+        self.nlayers = num_layers(model)
+        self.beta_dict = {
+            cid: self.beta for cid in range(client_num)
+        }
+        self.gb_dict = {
+            cid: (self.gb, self.norm1.item(), self.norm2.item()) for cid in range(client_num)
+        }
+                   
+    def save_state(self):
+        self.opt_state_dict[self.client_id] = deepcopy(self.optimizer.state_dict())
+        self.beta_dict[self.client_id] = deepcopy(self.beta) 
+        self.gb_dict[self.client_id] = (deepcopy(self.gb), self.norm1, self.norm2)
+        self.personal_params_dict[self.client_id] = deepcopy(self.pers_model.state_dict())
+        self.gFval_pers_model_params_dict[self.client_id] = deepcopy(self.gFval_pers_model.state_dict())
+        self.gFtrg_pers_model_params_dict[self.client_id] = deepcopy(self.gFtrg_pers_model.state_dict())
+
+    def set_parameters(self, new_parameters, pers_param=None, gFval_param = None, gFtr_param=None):
+        pers_param = self.personal_params_dict[self.client_id]
+        gFval_param = self.gFval_pers_model_params_dict[self.client_id]
+        gFtr_param = self.gFtrg_pers_model_params_dict[self.client_id]
+        self.beta = self.beta_dict[self.client_id]
+        self.gb = self.gb_dict[self.client_id][0] 
+        self.model.load_state_dict(new_parameters, strict=False)
+        self.pers_model.load_state_dict(pers_param, strict=False) # load theta_i
+        self.gFtrg_pers_model.load_state_dict(gFtr_param, strict=False) # load theta_i
+        self.gFval_pers_model.load_state_dict(gFval_param, strict=False) # load theta_i
+
+    def train(
         self,
-        algo: str = "Peacoc",
-        args: Namespace = None,
-        unique_model=False,
-        default_trainer=False,
-    ):
-        if args is None:
-            args = get_peacoc_argparser().parse_args()
-        super().__init__(algo, args, unique_model, default_trainer)
-        wandb.init(project = self.args.pj, name = self.args.dn)
-        
-        # init model(s) parameters
-        self.model = MODEL_DICT[self.args.model](self.args.dataset).to(self.device)
-        self.pers_model = MODEL_DICT[self.args.model](self.args.dataset).to(self.device)
-        self.gFval_pers_model = MODEL_DICT[self.args.model](self.args.dataset).to(self.device)
-        self.gFtrg_pers_model = MODEL_DICT[self.args.model](self.args.dataset).to(self.device)
-        self.pers_model.check_avaliability()
-        self.model.check_avaliability()
-        self.trainer = PeacocClient(
-            deepcopy(self.model), self.args, self.logger, self.client_num_in_total, 
-            deepcopy(self.pers_model), deepcopy(self.gFval_pers_model), deepcopy(self.gFtrg_pers_model)
-        )
-        self.trainable_params_name, init_trainable_params = trainable_params(
-            self.model, requires_name=True
-        )
-        self.global_params_dict: OrderedDict[str, torch.nn.Parameter] = OrderedDict(
-            zip(self.trainable_params_name, deepcopy(init_trainable_params))
-        )
-        self.client_trainable_params: List[List[torch.Tensor]] = [
-                deepcopy(init_trainable_params) for _ in self.train_clients
-            ]
-        self.gFval_trainable_params: List[List[torch.Tensor]] = [
-                deepcopy(init_trainable_params) for _ in self.train_clients
-            ]
-        self.gFtr_trainable_params: List[List[torch.Tensor]] = [
-                deepcopy(init_trainable_params) for _ in self.train_clients
-            ]
-        self.output_betagFval = deepcopy(self.model)
-        self.T = self.args.temperature #wandb.config.T #
-        self.prealpha = torch.FloatTensor(self.args.lmb)
-        self.soft = torch.nn.Softmax(dim=0)
-        self.alpha = self.soft(self.prealpha/self.T)  # torch.FloatTensor([1 / self.client_num_in_total] * self.client_num_in_total)
-        # self.alpha = self.softmaxwT(self.prealpha, self.T)  # torch.FloatTensor([1 / self.client_num_in_total] * self.client_num_in_total)
-        self.ga = torch.FloatTensor([0] * self.client_num_in_total)
-        self.global_lr = self.args.global_lr # wandb.config.glr
-        self.alpha_list, self.ga_list, self.prealpha_list, self.beta_list, self.gb_list, self.gFtr0_list, self.agg_beta, self.norm1_list, self.norm2_list  = [], [], [], [], [], [], [], [], []
-        self.num_list = list(range(self.client_num_in_total))
-        self.beta_dict = {i: {} for i in range(self.args.global_epoch)}
-        self.gb_dict = {i: {} for i in range(self.args.global_epoch)}
-        
-    def train(self):
-        for E in self.train_progress_bar:
-            self.current_epoch = E
-            for param in trainable_params(self.output_betagFval):
-                param = torch.zeros_like(param)
-            if (E + 1) % self.args.verbose_gap == 0:
-                self.logger.log("-" * 20, f"TRAINING EPOCH: {E + 1}", "-" * 20)
-            if (E + 1) % self.args.test_gap == 0:
-                self.test()
-                
-            self.selected_clients = self.client_sample_stream[E]
-            
-            gFval_params_cache = []
-            gFtrg_params_cache = []
-            beta_weight_cache = []
-            client_ids = []
-            for client_id in self.selected_clients:
-                new_parameters, pers_param, gFval_param, gFtr_param = self.generate_client_params(client_id)
-                gFval_m, gFtrg_m, self.beta_dict[E][client_id], self.gb_dict[E][client_id], self.client_stats[client_id][E] = self.trainer.train(
-                    client_id=client_id,
-                    new_parameters = new_parameters,
-                    pers_param = pers_param,
-                    gFval_param = gFval_param, 
-                    gFtr_param = gFtr_param,
-                    verbose=((E + 1) % self.args.verbose_gap) == 0,
+        client_id: int,
+        new_parameters,
+        pers_param,
+        gFval_param,
+        gFtr_param, 
+        verbose=False,):
+        self.client_id = client_id
+        self.load_dataset()
+        self.set_parameters(new_parameters=new_parameters, pers_param=pers_param, gFval_param=gFval_param, gFtr_param=gFtr_param, )
+        eval_stats = self.train_and_log(verbose=verbose)
+        return( deepcopy(trainable_params(self.gFval_pers_model)),
+                deepcopy(trainable_params(self.gFtrg_pers_model)), 
+                deepcopy(torch.tensor([self.beta])),
+                deepcopy(torch.tensor([self.gb])),
+                eval_stats,
                 )
 
-                gFval_params_cache.append(gFval_m)
-                gFtrg_params_cache.append(gFtrg_m)
-                beta_weight_cache.append(self.beta_dict[E][client_id])
-                client_ids.append(client_id)
-            self.aggregate(gFval_params_cache, gFtrg_params_cache, beta_weight_cache, client_ids)
-            self.log_info()
+    def _fit(self, training_model, dataloader, epochs):
+        training_model.train()
+        optimizer = SGD(
+            trainable_params(training_model),
+            self.local_lr,
+            self.args.momentum,
+            self.args.weight_decay,
+        )       
+        for _ in range(epochs):
+            for x, y in dataloader:
+                if len(x) <= 1:
+                    continue
+                x, y = x.to(self.device), y.to(self.device)
+                logit = training_model(x)
+                loss = self.criterion(logit, y)
+                optimizer.zero_grad()
+                loss.backward()
+                if training_model == self.pers_model:
+                    for pers_param, global_param in zip(
+                        trainable_params(training_model),
+                        trainable_params(self.model),
+                        ):
+                        beta = self.beta.item()
+                        pers_param_copy = beta * (pers_param.clone() - global_param.clone())
+                        pers_param_grad_copy = pers_param.grad.clone()  # make a copy of pers_param
+                        pers_param.grad.data = pers_param_grad_copy + pers_param_copy # assign the modified copy back to pers_param `
+                optimizer.step()
+                
+    def fit(self):
+        if self.beta == 0 and  self.gb == 0:
+            self.beta, self.gb = torch.tensor([self.args.invlmb[self.client_id]]), torch.tensor([0])
+        sub_gi, global_model = deepcopy(self.model), deepcopy(self.model)
+        for sub_gi_param, pers_param in zip(
+                    sub_gi.parameters(),
+                    self.pers_model.parameters(),
+                    ):
+            sub_gi_param.data = sub_gi_param.data - pers_param.data
+        cos, self.norm1, self.norm2 = multiply_model(trainable_params(sub_gi), trainable_params(self.gFval_pers_model), normalize=True)
+        if self.args.ab == 'b' or self.args.ab == 'B': 
+            self.gb = self.args.local_lr * cos
+            new_beta = self.beta - self.gb 
+            gb = deepcopy(self.gb)
+            self.gb = gb
+            if new_beta >= 0:
+                self.beta = new_beta
+            self.beta, self.gb = torch.tensor([self.beta]), torch.tensor([self.gb])
+
+        self._fit( global_model, self.trainloader, self.local_epoch)
+        self._fit( self.pers_model, self.trainloader, self.local_epoch)
+
+        for gtrg_param, model_param, global_param in zip(self.gFtrg_pers_model.parameters(), 
+                                                        self.model.parameters(),
+                                                        global_model.parameters(),):
+            gtrg_param.data = model_param.data - global_param.data
             
-            
-    def test(self):
-        loss_before, loss_after = [], []
-        correct_before, correct_after = [], []
-        num_samples = []
+        # Calculate gFval_i = after - before  theta_i
+        pers_bf, pers_af = deepcopy(self.pers_model), deepcopy(self.pers_model) # before  theta_i
+        self._fit(pers_af, self.valloader, 5)
 
-        for client_id in self.test_clients:
-            new_parameters, _, _, _ = self.generate_client_params(client_id)
-            stats = self.trainer.test(client_id, new_parameters)
+        for gFval_param, af_param, bf_param in zip(self.gFval_pers_model.parameters(), pers_af.parameters(), pers_bf.parameters()):
+            gFval_param.data = (af_param.data - bf_param.data)/5.0
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+    def evaluate(self) -> Dict[str, Dict[str, float]]:
+        return super().evaluate(self.pers_model)
 
-            correct_before.append(stats["before"]["test_correct"])
-            correct_after.append(stats["after"]["test_correct"])
-            loss_before.append(stats["before"]["test_loss"])
-            loss_after.append(stats["after"]["test_loss"])
-            num_samples.append(stats["before"]["test_size"])
-        
-        loss_before = torch.tensor(loss_before)
-        loss_after = torch.tensor(loss_after)
-        correct_before = torch.tensor(correct_before)
-        correct_after = torch.tensor(correct_after)
-        num_samples = torch.tensor(num_samples)
-        
-        self.test_results[self.current_epoch + 1] = {
-            "loss": "{:.4f} -> {:.4f}".format(
-                loss_before.sum() / num_samples.sum(),
-                loss_after.sum() / num_samples.sum(),
-            ),
-            "accuracy": "{:.2f}% -> {:.2f}%".format(
-                correct_before.sum() / num_samples.sum() * 100,
-                correct_after.sum() / num_samples.sum() * 100,
-            ),
-        }
-        
-        
-    @torch.no_grad()
-    def aggregate(self, gFval_params_cache, gFtrg_params_cache, beta_weight_cache, client_ids):                            
-        # Calculate sum beta * gFval_i  
-        beta_weight_cache = torch.tensor(beta_weight_cache, device=self.device)
-        aggregated_betagFval = [
-            torch.sum(beta_weight_cache * torch.stack(diff, dim=-1), dim=-1)
-            for diff in zip(*gFval_params_cache)
-        ]
-        norm2_list = torch.FloatTensor([0] * self.client_num_in_total)
-        for idx, diff in enumerate(gFval_params_cache):
-            params = [item for item in diff]
-            params2 = beta_weight_cache[idx] * torch.cat([torch.flatten(torch.Tensor(p)) for p in params])
-            norm2 = torch.linalg.norm(params2).reshape(1, -1).item()
-            # print(norm2, idx, beta_weight_cache[idx], client_ids[idx], self.trainer.beta_dict, beta_weight_cache)
-            norm2_list[client_ids[idx]] = norm2
-        self.agg_beta.append(norm2_list.clone().to('cpu').tolist())
-        norm1_list = torch.FloatTensor([0] * self.client_num_in_total)
-        if self.args.ab == 'a' or self.args.ab == 'B': 
-            ## sum beta * gFval_i
-            for idx, client_id in enumerate(client_ids):
-                cos, norm1, _ = multiply_model(gFtrg_params_cache[idx], aggregated_betagFval, normalize=True)
-                self.ga[client_id] = cos
-                norm1_list[client_id] = norm1
-            self.ga = -self.ga * self.args.local_lr * self.args.global_lr * 1e+4
-            self.ga = normalize(self.ga, p=1.0, dim = 0)
-            self.prealpha = self.alpha - (1/self.T) * self.ga * self.soft(self.alpha/self.T) * (1-self.soft(self.alpha/self.T))
-            self.alpha = self.soft(self.prealpha/self.T) 
-
-        self.gFtr0_list.append(norm1_list.clone().to('cpu').tolist())
-            
-        cur_alpha = torch.index_select(self.alpha, 0, torch.as_tensor(client_ids)).to(self.device)
-        aggregated_delta = [
-            torch.sum(cur_alpha * torch.stack(diff, dim=-1), dim=-1)
-            for diff in zip(*gFtrg_params_cache)
-        ]
-        ## aggregate global model
-        for param, diff in zip(self.global_params_dict.values(), aggregated_delta):
-            param.data -= self.args.global_lr * diff.to(self.device)
-            
-        self.alpha_list.append(self.alpha.clone().to('cpu').tolist())
-        self.ga_list.append(self.ga.clone().to('cpu').tolist())
-        self.prealpha_list.append(self.prealpha.clone().to('cpu').tolist())
-        betas = {k: v for k, v in self.trainer.beta_dict.items()}
-        gbs = {k: v[0] for k, v in self.trainer.gb_dict.items()}
-        norm1 = {k: v[1] for k, v in self.trainer.gb_dict.items()}
-        norm2 = {k: v[2] for k, v in self.trainer.gb_dict.items()}
-        
-        betas, gbs = list(betas.values()), list(gbs.values())
-        norm1, norm2 = list(norm1.values()), list(norm2.values())
-        
-        self.beta_list.append(betas)
-        self.gb_list.append(gbs)
-        self.norm1_list.append(norm1)
-        self.norm2_list.append(norm2)
-
-        wandb_params_dict = {'beta':self.beta_list, 'gb':self.gb_list, 
-                                'alpha':self.alpha_list, 'ga':self.ga_list, 'pre_alpha':self.prealpha_list, 
-                                'theta_0-theta_i':self.norm1_list, 'gFval_i':self.norm2_list, 'gFtr0': self.gFtr0_list, 
-                                'beta_gFval':self.agg_beta}
-        keys = ['client {}'.format(client_id) for client_id in self.num_list]
-        for key, value in wandb_params_dict.items():
-            wandb.log({key: 
-                wandb.plot.line_series( xs=list(range(self.current_epoch + 1)), 
-                                        ys=torch.Tensor(value).T,
-                                        keys=keys,
-                                        title='{}'.format(key),
-                                        xname='Global Rounds')})
-
-    
-    def generate_client_params(self, client_id: int): # OrderedDict[str, torch.Tensor]:
-        return (self.global_params_dict, OrderedDict(
-                zip(self.trainable_params_name, self.client_trainable_params[client_id])
-            ),    OrderedDict(
-                zip(self.trainable_params_name, self.gFval_trainable_params[client_id])
-            ),  OrderedDict(
-                zip(self.trainable_params_name, self.gFtr_trainable_params[client_id])
-            ))
-        
-            
-    def softmaxwT(self, logits, T):
-        max_input = torch.max(logits)
-        stabilized_inputs = logits - max_input
-        logits = torch.softmax(stabilized_inputs, dim=0)
-        logits = logits.tolist()
-        logits = [x/T for x in logits]
-        bottom = sum([math.exp(x) for x in logits])
-        softmax = [max(round(math.exp(x)/bottom, 6), 0) for x in logits]
-        return torch.FloatTensor(softmax)
-
-if __name__ == "__main__":
-    server = PeacocServer()
-    server.run()
-    gc.collect()
-    torch.cuda.empty_cache()
+    def _evaluate(self) -> Dict[str, Dict[str, float]]:
+        return super().evaluate(self.model)
