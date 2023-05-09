@@ -1,25 +1,36 @@
-from argparse import Namespace
-from copy import deepcopy
+from fedavg import FedAvgClient
+from src.config.utils import trainable_params
+import numpy as np
+import math
+import torch 
 
-from fedavg import FedAvgServer
-from src.config.args import get_fedprox_argparser
-from src.client.fedprox import FedProxClient
+class FedProxClient(FedAvgClient):
+    def __init__(self, model, args, logger):
+        super(FedProxClient, self).__init__(model, args, logger)
 
+    def train(self, client_id, new_parameters, verbose=False):
+        delta, _, stats = super().train(
+            client_id, new_parameters, return_diff=True, verbose=verbose
+        )
+        self.client_id = client_id
+        return delta, self.args.invlmb[self.client_id], stats
+        # return delta, 1.0, stats
 
-class FedProxServer(FedAvgServer):
-    def __init__(
-        self,
-        algo: str = "FedProx",
-        args: Namespace = None,
-        unique_model=False,
-        default_trainer=False,
-    ):
-        if args is None:
-            args = get_fedprox_argparser().parse_args()
-        super().__init__(algo, args, unique_model, default_trainer)
-        self.trainer = FedProxClient(deepcopy(self.model), self.args, self.logger)
+    def fit(self):
+        self.model.train()
+        global_params = [p.clone().detach() for p in trainable_params(self.model)]
+        for i in range(self.local_epoch):
+            for x, y in self.trainloader:
+                if len(x) <= 1:
+                    continue
 
-
-if __name__ == "__main__":
-    server = FedProxServer()
-    server.run()
+                x, y = x.to(self.device), y.to(self.device)
+                logit = self.model(x)
+                loss = self.criterion(logit, y)
+                self.optimizer.zero_grad()
+                loss.backward()
+                for w, w_t in zip(trainable_params(self.model), global_params):
+                    w.grad.data += self.args.invlmb[self.client_id] * (w.data - w_t.data)
+                    # w.grad.data += self.args.mu * (w.data - w_t.data)
+                self.optimizer.step()
+        # print('fit', self.args.prox_lambda, self.args.lmb[self.client_id] * (1/(i+1)))
